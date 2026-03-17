@@ -1,169 +1,78 @@
-# Latest-Value Price Service — Kafka Edition
+# Latest Value Price Service
 
-A single-JVM implementation of the latest-value price service using an
-**embedded Apache Kafka broker** (KRaft mode, no ZooKeeper).
+A Java application demonstrating a high-performance price tracker for financial instruments. It began as a robust, thread-safe in-memory batch mechanism and has been expanded to support a real-time **Publish-Subscribe architecture** using **Apache Kafka**.
 
----
+## Architecture & Components
 
-## Architecture
+The application contains two core mechanisms for managing latest prices:
 
-```
-┌──────────────────────────────── Single JVM ──────────────────────────────────┐
-│                                                                               │
-│   PriceService API  ─────────────────────────────────────────────────────    │
-│        │  startBatch / uploadPrices / completeBatch / cancelBatch            │
-│        ▼                                                                      │
-│   KafkaPriceService                                                           │
-│        │                                                                      │
-│        │  one KafkaProducer (transactional) per open batch                   │
-│        ▼                                                                      │
-│   ┌─────────────────────────────────────────────┐                            │
-│   │   Embedded Kafka Broker (KRaft, port=auto)  │                            │
-│   │                                             │                            │
-│   │   topic: prices-raw   (8 partitions)        │                            │
-│   │   topic: batch-events (1 partition)         │                            │
-│   └─────────────────────────────────────────────┘                            │
-│        │                                                                      │
-│        │  KafkaConsumer  isolation.level=read_committed                       │
-│        ▼                                                                      │
-│   LatestPriceStore  (AtomicReference<Map> snapshot)                          │
-│        │                                                                      │
-│        ▼                                                                      │
-│   getLatestPrices()  ──── pure in-memory read, never touches Kafka           │
-└───────────────────────────────────────────────────────────────────────────────┘
-```
+### 1. Kafka Publish-Subscribe (Real-time)
+A scalable streaming approach implementing pub/sub with Kafka.
+* **`KafkaPriceProducer`**: Acts as the Publisher, serializing `PriceRecord` updates and dispatching them to a single Kafka topic. It guarantees ordering per instrument using the instrument ID as the message key.
+* **`KafkaPriceConsumer`**: Acts as the Subscriber. It polls the Kafka topic in a separate background thread and updates a thread-safe `ConcurrentMap` to provide atomic access to the latest price values.
 
----
+### 2. In-Memory Batch Service (Legacy)
+Contained within `PriceService.java`, this is a high-concurrency, strictly in-memory data store. 
+* It accepts massive batched chunks uploading simultaneously across multiple threads.
+* It guarantees single-transaction visibility, ensuring consumers never see "half-completed" batches.
 
-## Key design decisions
+## Prerequisites
 
-| Decision | Rationale |
-|----------|-----------|
-| **One transactional producer per batch** | Batches can be open concurrently; each has independent transaction state. Kafka transaction epochs are per-transactional-id, so using the batchId as the id keeps them isolated. |
-| **`isolation.level=read_committed`** | The broker enforces the atomicity requirement at the protocol level — consumers never see records from an aborted or still-open transaction. |
-| **Eager store update on `completeBatch`** | After commit, `KafkaPriceService.completeBatch` immediately applies the records to `LatestPriceStore` without waiting for the consumer poll cycle. This gives zero-delay reads after a complete. The background consumer still processes the committed records; `applyBatch` is idempotent so the double-apply is harmless. |
-| **`AtomicReference<Map>` snapshot** | `getLatestPrices` performs a single volatile read and never blocks. Writes (batch completion) build a new immutable map and CAS it in — no locks on the read path. |
-| **Within-batch deduplication in `BatchState`** | If the same instrument appears in multiple parallel chunks, we merge eagerly in memory (keeping highest `asOf`) before sending to Kafka. This reduces broker load. |
-| **KRaft mode** | Removes the ZooKeeper dependency entirely. `EmbeddedKafkaBroker` formats the log directory and starts a combined broker+controller node in one step. |
+To run the full publish-subscribe demo, you will need:
+- **Java 17+**
+- **Apache Maven** (`mvn`)
+- **Docker Compose** (for running the local Zookeeper-less Kafka broker) 
 
----
+## Quick Start (Interactive Demo)
 
-## Running the tests
+The project includes a built-in interactive CLI application to easily demo Kafka in real-time.
 
+1. **Start the local Apache Kafka broker:**
+   The project includes a highly optimized GraalVM Kafka native image for split-second local startup.
+   ```bash
+   docker-compose up -d
+   ```
+
+2. **Run the Interactive CLI:**
+   You can launch the CLI using the provided script file which will ensure Docker is up and launch Maven:
+   ```cmd
+   run.bat
+   ```
+   *(Alternatively, run `mvn compile exec:java "-Dexec.mainClass=com.assignment.price.Application"`)*
+
+3. **Explore the CLI:**
+   Once loaded, you can send mocked market signals and instantly query consumer datasets:
+   ```text
+   > publish AAPL 155.00
+   Published: AAPL at 155.00
+   
+   > publish MSFT 310.25
+   Published: MSFT at 310.25
+   
+   > query AAPL MSFT
+   --- Latest Prices ---
+   Instrument: AAPL
+     Timestamp: 2026-03-15T20:04:20.976551900
+     Payload: {"price": 155.00}
+   Instrument: MSFT
+     Timestamp: 2026-03-15T20:04:40.123456700
+     Payload: {"price": 310.25}
+   ---------------------
+   ```
+
+4. **Tear Down:**
+   To spin down the Docker broker:
+   ```bash
+   docker-compose down
+   ```
+
+## Configuration
+
+* You can configure logging verbosity (e.g. toggle to `DEBUG` to see Kafka networking layer logs) inside `src/main/resources/simplelogger.properties`.
+
+## Testing Stack
+
+The project relies on **JUnit 5 Jupiter** for core testing configurations targeting the thread-safety logic present in the components. Build tests can be triggered simply by:
 ```bash
-# Gradle
-./gradlew test
-
-# Maven
 mvn test
 ```
-
-The embedded broker starts automatically as part of `@BeforeAll`. Expect the
-first run to take 20–40 s while Gradle/Maven download dependencies; subsequent
-runs are 5–10 s.
-
----
-
-## Project layout
-
-```
-src/
-├── main/java/com/priceservice/
-│   ├── api/
-│   │   ├── PriceRecord.java          # Immutable domain record
-│   │   └── PriceService.java         # Public API interface
-│   ├── impl/
-│   │   ├── KafkaPriceService.java    # Main implementation
-│   │   ├── BatchState.java           # Per-batch producer + staging area
-│   │   └── LatestPriceStore.java     # Lock-free in-memory snapshot store
-│   └── kafka/
-│       ├── EmbeddedKafkaBroker.java  # KRaft broker lifecycle
-│       ├── PriceRecordSerializer.java # JSON codec
-│       └── Topics.java               # Topic name constants
-└── test/java/com/priceservice/
-    └── KafkaPriceServiceTest.java    # 21 tests covering all requirements
-```
-
----
-
-## REST API
-
-Start the application:
-
-```bash
-./gradlew bootRun
-# or
-mvn spring-boot:run
-```
-
-### Endpoints
-
-#### Start a batch
-```
-POST /batches
-→ 201 Created
-  Location: /batches/batch-1
-  { "batchId": "batch-1" }
-```
-
-#### Upload a chunk of prices
-```
-POST /batches/{id}/prices
-Content-Type: application/json
-
-{
-  "prices": [
-    { "id": "AAPL", "asOf": "2024-01-01T10:00:00Z", "payload": { "bid": 149.5, "ask": 150.5 } },
-    { "id": "MSFT", "asOf": "2024-01-01T10:00:00Z", "payload": { "bid": 299.0, "ask": 301.0 } }
-  ]
-}
-→ 202 Accepted
-```
-
-#### Complete a batch (atomic publish)
-```
-POST /batches/{id}/complete
-→ 204 No Content
-```
-
-#### Cancel a batch
-```
-POST /batches/{id}/cancel
-→ 204 No Content
-```
-
-#### Query latest prices
-```
-GET /prices?ids=AAPL,MSFT
-→ 200 OK
-{
-  "prices": {
-    "AAPL": { "id": "AAPL", "asOf": "2024-01-01T10:00:00Z", "payload": { ... } },
-    "MSFT": { "id": "MSFT", "asOf": "2024-01-01T10:00:00Z", "payload": { ... } }
-  }
-}
-```
-
-### Error responses
-
-All errors return a consistent JSON envelope:
-
-```json
-{ "status": 400, "error": "Bad Request", "message": "No open batch 'batch-99'." }
-```
-
-| Status | Cause |
-|--------|-------|
-| 400 | Unknown/closed batch id, blank instrument id, null asOf, empty prices list |
-| 400 | Missing `?ids=` query parameter |
-| 415 | Wrong Content-Type (must be `application/json`) |
-| 500 | Unexpected internal error |
-
----
-
-## Test layers
-
-| Test class | What it covers | Kafka needed? |
-|---|---|---|
-| `KafkaPriceServiceTest` | Service logic, Kafka transactions, atomicity, concurrency | Yes (embedded) |
-| `PriceControllerTest` | HTTP routing, validation, serialisation, error codes | No (mock service) |
