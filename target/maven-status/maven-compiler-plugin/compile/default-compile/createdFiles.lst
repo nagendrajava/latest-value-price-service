@@ -1,7 +1,0 @@
-com\assignment\price\KafkaPriceProducer.class
-com\assignment\price\KafkaPriceConsumer.class
-com\assignment\price\PriceSerializer.class
-com\assignment\price\PriceDeserializer.class
-com\assignment\price\PriceService.class
-com\assignment\price\Application.class
-com\assignment\price\PriceRecord.class
